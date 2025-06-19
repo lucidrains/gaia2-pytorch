@@ -73,21 +73,34 @@ class Attention(Module):
 
         self.norm = nn.RMSNorm(dim)
 
-        self.split_heads = Rearrange('b n (qkv h d) -> qkv b h n d', qkv = 3, h = heads)
+        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
-        self.to_qkv = LinearNoBias(dim, dim_inner * 3)
+        self.to_q = LinearNoBias(dim, dim_inner)
+        self.to_kv = LinearNoBias(dim, dim_inner * 2)
         self.to_out = LinearNoBias(dim_inner, dim)
 
     def forward(
         self,
-        tokens
+        tokens: Float['b i d'],
+        context: Float['b j d'] | None = None,
+        context_mask: Bool['b j'] | None = None
     ):
+        """
+        q - queries
+        k - keys
+        v - values
+        """
+
+        kv_tokens = default(context, tokens)
+
         tokens = self.norm(tokens)
 
-        qkv = self.to_qkv(tokens)
+        q = self.to_q(tokens)
 
-        q, k, v = self.split_heads(qkv)
+        k, v = self.to_kv(kv_tokens).chunk(2, dim = -1)
+
+        q, k, v = tuple(self.split_heads(t) for t in (q, k, v))
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
 
