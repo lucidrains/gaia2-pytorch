@@ -18,3 +18,14 @@ Please let me know your thoughts of the paper [here](https://discord.gg/na5MQBUJ
     url     = {https://api.semanticscholar.org/CorpusID:277321454}
 }
 ```
+
+```bibtex
+@article{Rombach2021HighResolutionIS,
+    title   = {High-Resolution Image Synthesis with Latent Diffusion Models},
+    author  = {Robin Rombach and A. Blattmann and Dominik Lorenz and Patrick Esser and Bj{\"o}rn Ommer},
+    journal = {2022 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    year    = {2021},
+    pages   = {10674-10685},
+    url     = {https://api.semanticscholar.org/CorpusID:245335280}
+}
+```
