@@ -4,6 +4,7 @@ from gaia2_pytorch.tensor_typing import Float, Int, Bool
 from functools import partial
 
 import torch
+import torch.nn.functional as F
 from torch import nn, cat, stack, is_tensor
 from torch.nn import Module, ModuleList, Linear, Sequential
 
@@ -130,6 +131,7 @@ def FeedForward(dim, expansion_factor = 4.):
 class Gaia2(Module):
     def __init__(
         self,
+        dim_input,
         dim = 512,
         *,
         depth = 24,
@@ -138,6 +140,8 @@ class Gaia2(Module):
         ff_expansion_factor = 4.
     ):
         super().__init__()
+
+        self.to_tokens = Linear(dim_input, dim)
 
         layers = []
 
@@ -171,10 +175,34 @@ class Gaia2(Module):
 
         self.final_norm = nn.RMSNorm(dim)
 
+        self.to_pred_flow = LinearNoBias(dim, dim_input)
+
     def forward(
         self,
-        tokens: Float['b t h w d']
+        data: Float['b t h w d'],
+        return_flow_loss = False
     ):
+
+        batch, device = data.shape[0], data.device
+
+        # flow matching is easy
+        # you just noise some random amount and store the flow as data - noise, then force it to predict that velocity
+
+        if return_flow_loss:
+            # do their bimodal lognorm thingy later
+
+            times = torch.rand((batch,), device = device)
+
+            noise = torch.randn_like(data)
+
+            flow = data - noise
+
+            times = rearrange(times, 'b -> b 1 1 1 1')
+            tokens = noise.lerp(data, times) # read as (noise * (1. - time) + data * time)
+
+        # transformer
+
+        tokens = self.to_tokens(data)
 
         tokens, inv_pack_space = pack_with_inverse(tokens, 'b t * d')
 
@@ -209,4 +237,12 @@ class Gaia2(Module):
 
         tokens = self.final_norm(tokens)
 
-        return tokens
+        # flow matching
+
+        pred_flow = self.to_pred_flow(tokens)
+
+        if not return_flow_loss:
+            return pred_flow
+
+        return F.mse_loss(pred_flow, flow)
+
