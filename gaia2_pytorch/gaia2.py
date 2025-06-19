@@ -11,6 +11,8 @@ import einx
 from einops import rearrange, pack, unpack, einsum
 from einops.layers.torch import Rearrange
 
+from ema_pytorch import EMA
+
 # einstein notation
 
 # b - batch
