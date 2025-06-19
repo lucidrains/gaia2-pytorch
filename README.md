@@ -6,6 +6,20 @@ Implementation of the [world model architecture](https://arxiv.org/abs/2503.2052
 
 Please let me know your thoughts of the paper [here](https://discord.gg/na5MQBUJqb), positive or negative, so I can gauge its significance / prioritize
 
+## Contributing
+
+```bash
+$ pip install '.[test]'
+```
+
+Then add a test to `tests` and run the following
+
+```bash
+$ pytest tests
+```
+
+That's it
+
 ## Citations
 
 ```bibtex
