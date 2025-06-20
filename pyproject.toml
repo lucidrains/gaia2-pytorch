@@ -1,6 +1,6 @@
 [project]
 name = "gaia2-pytorch"
-version = "0.0.10"
+version = "0.0.11"
 description = "Gaia2 - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

@@ -2,6 +2,7 @@ from __future__ import annotations
 from gaia2_pytorch.tensor_typing import Float, Int, Bool
 
 from functools import partial
+from itertools import zip_longest
 
 import torch
 import torch.nn.functional as F
@@ -160,11 +161,13 @@ class Transformer(Module):
         depth,
         dim_head = 64,
         heads = 16,
-        ff_expansion_factor = 4.
+        ff_expansion_factor = 4.,
+        has_time_attn = True
     ):
         super().__init__()
 
-        layers = []
+        space_layers = []
+        time_layers = []
 
         attn_kwargs = dict(
             dim = dim,
@@ -180,19 +183,26 @@ class Transformer(Module):
         for _ in range(depth):
 
             space_attn = Attention(**attn_kwargs)
-            time_attn = Attention(**attn_kwargs)
-
             space_ff = FeedForward(**ff_kwargs)
-            time_ff = FeedForward(**ff_kwargs)
 
-            layers.append(ModuleList([
+            space_layers.append(ModuleList([
                 space_attn,
                 space_ff,
-                time_attn,
-                time_ff
             ]))
 
-        self.layers = ModuleList(layers)
+            if not has_time_attn:
+                continue
+
+            time_attn = Attention(**attn_kwargs)
+            time_ff = FeedForward(**ff_kwargs)
+
+            time_layers.append(ModuleList([
+                time_attn,
+                time_ff,
+            ]))
+
+        self.space_layers = ModuleList(space_layers)
+        self.time_layers = ModuleList(time_layers)
 
         self.final_norm = nn.RMSNorm(dim)
 
@@ -201,10 +211,8 @@ class Transformer(Module):
 
         for (
             space_attn,
-            space_ff,
-            time_attn,
-            time_ff
-        ) in self.layers:
+            space_ff
+        ), maybe_time_layer in zip_longest(self.space_layers, self.time_layers):
 
             # space attention
 
@@ -214,6 +222,11 @@ class Transformer(Module):
             tokens = space_ff(tokens) + tokens
 
             tokens = inv_pack_batch(tokens)
+
+            if not exists(maybe_time_layer):
+                continue
+
+            time_attn, time_ff = maybe_time_layer
 
             # time attention
 
@@ -259,7 +272,8 @@ class VideoTokenizer(Module):
             dim = dim,
             dim_head = dim_head,
             heads = heads,
-            depth = enc_depth
+            depth = enc_depth,
+            has_time_attn = False
         )
 
         # latents
