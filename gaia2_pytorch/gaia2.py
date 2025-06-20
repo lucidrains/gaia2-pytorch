@@ -6,8 +6,8 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 from torch import nn, cat, stack, tensor, is_tensor
-from torch.nn import Module, ModuleList, Linear, Sequential
-from torch.distributions import Normal, Categorical
+from torch.nn import Module, ModuleList, Linear, Conv3d, Sequential
+from torch.distributions import Normal, Categorical, kl_divergence
 
 import einx
 from einops import rearrange, repeat, pack, unpack, einsum
@@ -23,6 +23,7 @@ from ema_pytorch import EMA
 # t - time
 # h, w - height width of feature map or video
 # i, j - sequence (source, target)
+# tl, hl, wl - time, height, width of latents feature map
 
 # constants
 
@@ -147,13 +148,108 @@ def FeedForward(dim, expansion_factor = 4.):
         Linear(dim_inner, dim)
     )
 
+# video tokenizer
+
+class VideoTokenizer(Module):
+    def __init__(
+        self,
+        *,
+        channels = 3,
+        dim = 512,
+        dim_latent = 64, # they do a really small latent dimension, claims this brings about improvements
+        eps = 1e-6,
+        latent_loss_weight = 1.
+    ):
+        super().__init__()
+
+        self.eps = eps
+
+        # encoder
+
+        self.to_encode_tokens = Conv3d(channels, dim, 3, padding = 1)
+
+        # latents
+
+        self.to_latents = Conv3d(dim, dim_latent * 2, 1, bias = False)
+
+        self.latent_loss_weight = latent_loss_weight
+
+        self.gaussian = Normal(0., 1.)
+
+        # decoder
+
+        self.to_decode_tokens = Conv3d(dim_latent, dim, 1)
+
+        self.to_recon = Conv3d(dim, channels, 1, bias = False)
+
+    def encode(
+        self,
+        video: Float['b c t h w']
+    ):
+        tokens = self.to_encode_tokens(video)
+
+        latents = self.to_latents(tokens)
+
+        mean, log_var = rearrange(latents, 'b (d mean_var) ... -> mean_var b d ...', mean_var = 2)
+
+        var = log_var.exp()
+
+        return mean, var
+
+    def decode(
+        self,
+        latents: Float['b c tl hl wl']
+    ):
+        tokens = self.to_decode_tokens(latents)
+
+        recon = self.to_recon(tokens)
+
+        return recon
+
+    def forward(
+        self,
+        video: Float['b c t h w'],
+        return_breakdown = False,
+        return_recon_only = False
+    ):
+
+        orig_video = video
+
+        latent_mean, latent_var = self.encode(video)
+
+        latent_normal_distr = Normal(latent_mean, latent_var.sqrt())
+
+        sampled_latents = latent_normal_distr.sample()
+
+        recon = self.decode(sampled_latents)
+
+        if return_recon_only:
+            return recon
+
+        recon_loss = F.mse_loss(orig_video, recon)
+
+        latent_loss = kl_divergence(latent_normal_distr, self.gaussian).mean()
+
+        breakdown = (recon_loss, latent_loss)
+
+        total_loss = (
+            recon_loss + 
+            latent_loss * self.latent_loss_weight
+        )
+
+        if not return_breakdown:
+            return total_loss
+
+        return total_loss, breakdown
+
 # the main model is just a flow matching transformer, with the same type of conditioning from DiT (diffusion transformer)
 # the attention is factorized space / time
 
 class Gaia2(Module):
     def __init__(
         self,
-        dim_input,
+        tokenizer: Tokenizer | None = None,
+        dim_latent = 64,
         dim = 512,
         *,
         depth = 24,
@@ -168,7 +264,7 @@ class Gaia2(Module):
     ):
         super().__init__()
 
-        self.to_tokens = Linear(dim_input, dim)
+        self.to_tokens = Linear(dim_latent, dim)
 
         layers = []
 
