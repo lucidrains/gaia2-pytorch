@@ -6,6 +6,34 @@ Implementation of the [world model architecture](https://arxiv.org/abs/2503.2052
 
 Please let me know your thoughts of the paper [here](https://discord.gg/na5MQBUJqb), positive or negative, so I can gauge its significance / prioritize
 
+## Install
+
+```bash
+$ pip install gaia2-pytorch
+```
+
+## Usage
+
+```python
+import torch
+from gaia2_pytorch import VideoTokenizer, Gaia2
+
+video = torch.randn(1, 3, 10, 16, 16)
+
+tokenizer = VideoTokenizer()
+
+loss = tokenizer(video)
+loss.backward()
+
+gaia2 = Gaia2(tokenizer)
+
+loss = gaia2(video)
+loss.backward()
+
+generated = gaia2.generate((10, 16, 16))
+assert generated.shape == video.shape
+```
+
 ## Contributing
 
 ```bash

@@ -17,10 +17,10 @@ def test_gaia2(
 
     tokens = torch.randn(2, 8, 16, 16, 77)
 
-    out = model(tokens)
+    out = model(tokens, return_flow_loss = False)
     assert out.shape == tokens.shape
 
-    loss = model(tokens, return_flow_loss = True)
+    loss = model(tokens)
     loss.backward()
 
     sampled = model.generate((8, 16, 16), batch_size = 2)

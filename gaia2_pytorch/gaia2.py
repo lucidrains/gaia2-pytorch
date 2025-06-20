@@ -350,7 +350,8 @@ class VideoTokenizer(Module):
 
     def encode(
         self,
-        video: Float['b c t h w']
+        video: Float['b c t h w'],
+        return_sampled = False
     ):
         tokens = self.to_encode_tokens(video)
 
@@ -364,7 +365,10 @@ class VideoTokenizer(Module):
 
         var = log_var.exp()
 
-        return mean, var
+        if not return_sampled:
+            return mean, var
+
+        return torch.normal(mean, var.sqrt())
 
     def decode(
         self,
@@ -445,6 +449,8 @@ class Gaia2(Module):
 
         self.dim_latent = dim_latent
 
+        self.tokenizer = tokenizer
+
         self.to_tokens = Linear(dim_latent, dim)
 
         self.transformer = Transformer(
@@ -494,12 +500,21 @@ class Gaia2(Module):
         video_shape: tuple[int, int, int], # (time, height, width)
         batch_size = 1,
         steps = 16
-    ) -> Float['b tl hl wl d']:
+    ) -> (
+        Float['b tl hl wl d'] |
+        Float['b c t h w']
+    ):
 
         self.eval()
 
         def fn(step_times, denoised):
-            pred_flow = self.forward(denoised)
+
+            pred_flow = self.forward(
+                denoised,
+                return_flow_loss = False,
+                input_is_video = False
+            )
+
             return pred_flow
 
         output_shape = (batch_size, *video_shape, self.dim_latent)
@@ -509,20 +524,39 @@ class Gaia2(Module):
 
         trajectory = self.odeint_fn(fn, noise, times)
 
-        sampled = trajectory[-1]
-        return sampled
+        sampled_latents = trajectory[-1]
+
+        if not exists(self.tokenizer):
+            return sampled_latents
+
+        video = self.tokenizer.decode(sampled_latents)
+        return video
 
     def forward(
         self,
-        data: Float['b t h w d'],
-        return_flow_loss = False
+        video_or_latents: Float['b tl hl wl d'] | Float['b c t h w'],
+        input_is_video = None,
+        return_flow_loss = True
     ):
 
-        batch, device = data.shape[0], data.device
+        # if tokenizer is added, assume is video
+
+        input_is_video = default(input_is_video, exists(self.tokenizer))
+
+        if input_is_video:
+            with torch.no_grad():
+                self.tokenizer.eval()
+                latents = self.tokenizer.encode(video_or_latents, return_sampled = True)
+        else:
+            latents = video_or_latents
+
+        # shape and device
+
+        batch, device = latents.shape[0], latents.device
 
         # normalize data to zero mean, unit variance
 
-        data = normalize(data)
+        latents = normalize(latents)
 
         # flow matching is easy
         # you just noise some random amount and store the flow as data - noise, then force it to predict that velocity
@@ -549,16 +583,16 @@ class Gaia2(Module):
                 # else uniform
                 times = torch.rand(time_shape, device = device)
 
-            noise = torch.randn_like(data)
+            noise = torch.randn_like(latents)
 
-            flow = data - noise
+            flow = latents - noise
 
             times = rearrange(times, 'b -> b 1 1 1 1')
-            tokens = noise.lerp(data, times) # read as (noise * (1. - time) + data * time)
+            tokens = noise.lerp(latents, times) # read as (noise * (1. - time) + data * time)
 
         # transformer
 
-        tokens = self.to_tokens(data)
+        tokens = self.to_tokens(latents)
 
         attended = self.transformer(tokens)
 
