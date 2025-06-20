@@ -48,6 +48,9 @@ def default(v, d):
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
 
+def l2norm(t):
+    return F.normalize(t, dim = -1, p = 2)
+
 def normalize(t, eps = 1e-6):
     shape = t.shape[-1:]
     return F.layer_norm(t, shape, eps = eps)
@@ -150,6 +153,54 @@ def FeedForward(dim, expansion_factor = 4.):
         nn.GELU(),
         Linear(dim_inner, dim)
     )
+
+# adaptive norms for time conditioning (and ada-ln-zero fo DiT)
+
+class AdaRMSNorm(Module):
+    def __init__(
+        self,
+        dim,
+        dim_cond = None
+    ):
+        super().__init__()
+        self.scale = dim ** 0.5
+        dim_cond = default(dim_cond, dim)
+
+        self.to_gamma = LinearNoBias(dim_cond, dim)
+        nn.init.zeros_(self.to_gamma.weight)
+
+    def forward(
+        self,
+        x,
+        *,
+        cond
+    ):
+        normed = l2norm(x) * self.scale
+        gamma = self.to_gamma(cond)
+        return normed * (gamma + 1.)
+
+class AdaLNZero(Module):
+    def __init__(
+        self,
+        dim,
+        dim_cond = None,
+        init_bias_value = -2.
+    ):
+        super().__init__()
+        dim_cond = default(dim_cond, dim)
+        self.to_gamma = Linear(dim_cond, dim)
+
+        nn.init.zeros_(self.to_gamma.weight)
+        nn.init.constant_(self.to_gamma.bias, init_bias_value)
+
+    def forward(
+        self,
+        x,
+        *,
+        cond
+    ):
+        gamma = self.to_gamma(cond).sigmoid()
+        return x * gamma
 
 # transformer
 
