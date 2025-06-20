@@ -22,3 +22,6 @@ def test_gaia2(
 
     loss = model(tokens, return_flow_loss = True)
     loss.backward()
+
+    sampled = model.generate((8, 16, 16), batch_size = 2)
+    assert sampled.shape == tokens.shape

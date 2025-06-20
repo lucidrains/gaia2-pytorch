@@ -9,6 +9,8 @@ from torch import nn, cat, stack, tensor, is_tensor
 from torch.nn import Module, ModuleList, Linear, Conv3d, Sequential
 from torch.distributions import Normal, Categorical, kl_divergence
 
+from torchdiffeq import odeint
+
 import einx
 from einops import rearrange, repeat, pack, unpack, einsum
 from einops.layers.torch import Rearrange
@@ -260,9 +262,16 @@ class Gaia2(Module):
         logit_norm_distr = [
             (.8, (.5, 1.4)),
             (.2, (-3., 1.))
-        ]
+        ],
+        odeint_kwargs: dict = dict(
+            atol = 1e-5,
+            rtol = 1e-5,
+            method = 'midpoint'
+        ),
     ):
         super().__init__()
+
+        self.dim_latent = dim_latent
 
         self.to_tokens = Linear(dim_latent, dim)
 
@@ -320,6 +329,40 @@ class Gaia2(Module):
         # transformer to predicted flow
 
         self.to_pred_flow = LinearNoBias(dim, dim_latent)
+
+        # sampling
+
+        self.odeint_fn = partial(odeint, **odeint_kwargs)
+
+        self.register_buffer('dummy', tensor(0), persistent = False)
+
+    @property
+    def device(self):
+        return self.dummy.device
+
+    @torch.no_grad()
+    def generate(
+        self,
+        video_shape: tuple[int, int, int], # (time, height, width)
+        batch_size = 1,
+        steps = 16
+    ) -> Float['b tl hl wl d']:
+
+        self.eval()
+
+        def fn(step_times, denoised):
+            pred_flow = self.forward(denoised)
+            return pred_flow
+
+        output_shape = (batch_size, *video_shape, self.dim_latent)
+
+        noise = torch.randn(output_shape)
+        times = torch.linspace(0, 1, steps, device = self.device)
+
+        trajectory = self.odeint_fn(fn, noise, times)
+
+        sampled = trajectory[-1]
+        return sampled
 
     def forward(
         self,
