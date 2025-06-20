@@ -319,7 +319,7 @@ class Gaia2(Module):
 
         # transformer to predicted flow
 
-        self.to_pred_flow = LinearNoBias(dim, dim_input)
+        self.to_pred_flow = LinearNoBias(dim, dim_latent)
 
     def forward(
         self,

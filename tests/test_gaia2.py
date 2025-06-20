@@ -8,7 +8,7 @@ def test_gaia2(
     use_logit_norm_distr
 ):
     model = Gaia2(
-        dim_input = 77,
+        dim_latent = 77,
         dim = 32,
         depth = 1,
         heads = 4,
