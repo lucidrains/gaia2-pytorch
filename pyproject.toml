@@ -1,6 +1,6 @@
 [project]
 name = "gaia2-pytorch"
-version = "0.0.8"
+version = "0.0.9"
 description = "Gaia2 - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -30,6 +30,7 @@ dependencies = [
     "ema-pytorch",
     "hyper-connections",
     "torch>=2.4",
+    "torchdiffeq",
     "jaxtyping"
 ]
 
