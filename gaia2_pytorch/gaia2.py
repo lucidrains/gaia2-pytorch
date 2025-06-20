@@ -5,11 +5,12 @@ from functools import partial
 
 import torch
 import torch.nn.functional as F
-from torch import nn, cat, stack, is_tensor
+from torch import nn, cat, stack, tensor, is_tensor
 from torch.nn import Module, ModuleList, Linear, Sequential
+from torch.distributions import Normal, Categorical
 
 import einx
-from einops import rearrange, pack, unpack, einsum
+from einops import rearrange, repeat, pack, unpack, einsum
 from einops.layers.torch import Rearrange
 
 from ema_pytorch import EMA
@@ -38,6 +39,15 @@ def first(arr):
 def default(v, d):
     return v if exists(v) else d
 
+# tensor helpers
+
+def log(t, eps = 1e-20):
+    return t.clamp(min = eps).log()
+
+def normalize(t, eps = 1e-6):
+    shape = t.shape[-1:]
+    return F.layer_norm(t, shape, eps = eps)
+
 def pack_with_inverse(t, pattern):
     pack_one = is_tensor(t)
 
@@ -56,6 +66,18 @@ def pack_with_inverse(t, pattern):
         return out
 
     return packed, inverse
+
+# action transforms
+
+def symlog(value, value_max, scale):
+    # symmetric logarithmic transformation (5)
+    return value.sign() * log(1 + scale * value.abs()) / log(1 + scale * value_max.abs())
+
+def curvature_symlog(value, value_max, scale = 1000): # m^-1 (.0001 - .1)
+    return symlog(value, value_max, scale)
+
+def speed_symlog(value, value_max, scale = 3.6): # m/s (0-75)
+    return symlog(value, value_max, scale)
 
 # attention, still the essential ingredient
 
@@ -137,7 +159,12 @@ class Gaia2(Module):
         depth = 24,
         heads = 16,
         dim_head = 64,
-        ff_expansion_factor = 4.
+        ff_expansion_factor = 4.,
+        use_logit_norm_distr = True,
+        logit_norm_distr = [
+            (.8, (.5, 1.4)),
+            (.2, (-3., 1.))
+        ]
     ):
         super().__init__()
 
@@ -175,6 +202,27 @@ class Gaia2(Module):
 
         self.final_norm = nn.RMSNorm(dim)
 
+        # flow related
+
+        self.use_logit_norm_distr = use_logit_norm_distr
+
+        # construct their bimodal normal distribution - they have a second mode to encourage learning ego-motions and object trajectories
+
+        mode_probs = []
+        normal_distrs = []
+
+        for prob, (mean, std) in logit_norm_distr:
+            mode_probs.append(prob)
+            normal_distrs.append(tensor([mean, std]))
+
+        mode_probs = tensor(mode_probs)
+        assert mode_probs.sum().item() == 1.
+
+        self.register_buffer('mode_distr',mode_probs, persistent = False)
+        self.register_buffer('normal_mean_std', stack(normal_distrs), persistent = False)
+
+        # transformer to predicted flow
+
         self.to_pred_flow = LinearNoBias(dim, dim_input)
 
     def forward(
@@ -185,13 +233,34 @@ class Gaia2(Module):
 
         batch, device = data.shape[0], data.device
 
+        # normalize data to zero mean, unit variance
+
+        data = normalize(data)
+
         # flow matching is easy
         # you just noise some random amount and store the flow as data - noise, then force it to predict that velocity
 
         if return_flow_loss:
-            # do their bimodal lognorm thingy later
+            time_shape = (batch,)
 
-            times = torch.rand((batch,), device = device)
+            if self.use_logit_norm_distr:
+                # sample from bimodal normal distribution - section 2.2.4
+
+                expanded_normal_mean_std = repeat(self.normal_mean_std, '... -> b ...', b = batch)
+                mean, std = expanded_normal_mean_std.unbind(dim = -1)
+                all_sampled = torch.normal(mean, std)
+
+                batch_arange = torch.arange(batch, device = device)[:, None]
+                sel_normal_indices = Categorical(self.mode_distr).sample(time_shape)[:, None]
+
+                sel_samples = all_sampled[batch_arange, sel_normal_indices]
+                times = sel_samples.sigmoid()
+
+                times = rearrange(times, 'b 1 -> b')
+
+            else:
+                # else uniform
+                times = torch.rand(time_shape, device = device)
 
             noise = torch.randn_like(data)
 
