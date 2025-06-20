@@ -3,12 +3,16 @@ import pytest
 import torch
 from gaia2_pytorch.gaia2 import Gaia2
 
-def test_gaia2():
+@pytest.mark.parametrize('use_logit_norm_distr', (False, True))
+def test_gaia2(
+    use_logit_norm_distr
+):
     model = Gaia2(
         dim_input = 77,
         dim = 32,
         depth = 1,
-        heads = 4
+        heads = 4,
+        use_logit_norm_distr = use_logit_norm_distr
     )
 
     tokens = torch.randn(2, 8, 16, 16, 77)
