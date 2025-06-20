@@ -526,6 +526,10 @@ class Gaia2(Module):
 
         sampled_latents = trajectory[-1]
 
+        # enforce zero mean unit variance
+
+        sampled_latents = normalize(sampled_latents)
+
         if not exists(self.tokenizer):
             return sampled_latents
 
