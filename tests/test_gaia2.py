@@ -25,3 +25,13 @@ def test_gaia2(
 
     sampled = model.generate((8, 16, 16), batch_size = 2)
     assert sampled.shape == tokens.shape
+
+def test_tokenizer():
+    from gaia2_pytorch.gaia2 import VideoTokenizer
+
+    video = torch.randn(1, 3, 10, 16, 16)
+
+    tokenizer = VideoTokenizer()
+
+    loss = tokenizer(video)
+    loss.backward()

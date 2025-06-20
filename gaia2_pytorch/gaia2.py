@@ -150,6 +150,87 @@ def FeedForward(dim, expansion_factor = 4.):
         Linear(dim_inner, dim)
     )
 
+# transformer
+
+class Transformer(Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        depth,
+        dim_head = 64,
+        heads = 16,
+        ff_expansion_factor = 4.
+    ):
+        super().__init__()
+
+        layers = []
+
+        attn_kwargs = dict(
+            dim = dim,
+            heads = heads,
+            dim_head = dim_head
+        )
+
+        ff_kwargs = dict(
+            dim = dim,
+            expansion_factor = ff_expansion_factor
+        )
+
+        for _ in range(depth):
+
+            space_attn = Attention(**attn_kwargs)
+            time_attn = Attention(**attn_kwargs)
+
+            space_ff = FeedForward(**ff_kwargs)
+            time_ff = FeedForward(**ff_kwargs)
+
+            layers.append(ModuleList([
+                space_attn,
+                space_ff,
+                time_attn,
+                time_ff
+            ]))
+
+        self.layers = ModuleList(layers)
+
+        self.final_norm = nn.RMSNorm(dim)
+
+    def forward(self, tokens: Float['b tl hl wl d']):
+        tokens, inv_pack_space = pack_with_inverse(tokens, 'b t * d')
+
+        for (
+            space_attn,
+            space_ff,
+            time_attn,
+            time_ff
+        ) in self.layers:
+
+            # space attention
+
+            tokens, inv_pack_batch = pack_with_inverse(tokens, '* n d')
+
+            tokens = space_attn(tokens) + tokens
+            tokens = space_ff(tokens) + tokens
+
+            tokens = inv_pack_batch(tokens)
+
+            # time attention
+
+            tokens = rearrange(tokens, 'b t n d -> b n t d')
+            tokens, inv_pack_batch = pack_with_inverse(tokens, '* t d')
+
+            tokens = time_attn(tokens) + tokens
+            tokens = time_ff(tokens) + tokens
+
+            tokens = inv_pack_batch(tokens)
+            tokens = rearrange(tokens, 'b n t d -> b t n d')
+
+        tokens = inv_pack_space(tokens)
+
+        tokens = self.final_norm(tokens)
+        return tokens
+
 # video tokenizer
 
 class VideoTokenizer(Module):
@@ -160,7 +241,11 @@ class VideoTokenizer(Module):
         dim = 512,
         dim_latent = 64, # they do a really small latent dimension, claims this brings about improvements
         eps = 1e-6,
-        latent_loss_weight = 1.
+        latent_loss_weight = 1.,
+        dim_head = 64,
+        heads = 16,
+        enc_depth = 2,
+        dec_depth = 2
     ):
         super().__init__()
 
@@ -170,9 +255,16 @@ class VideoTokenizer(Module):
 
         self.to_encode_tokens = Conv3d(channels, dim, 3, padding = 1)
 
+        self.encode_transformer = Transformer(
+            dim = dim,
+            dim_head = dim_head,
+            heads = heads,
+            depth = enc_depth
+        )
+
         # latents
 
-        self.to_latents = Conv3d(dim, dim_latent * 2, 1, bias = False)
+        self.to_latents = LinearNoBias(dim, dim_latent * 2)
 
         self.latent_loss_weight = latent_loss_weight
 
@@ -180,7 +272,14 @@ class VideoTokenizer(Module):
 
         # decoder
 
-        self.to_decode_tokens = Conv3d(dim_latent, dim, 1)
+        self.to_decode_tokens = LinearNoBias(dim_latent, dim)
+
+        self.decode_transformer = Transformer(
+            dim = dim,
+            dim_head = dim_head,
+            heads = heads,
+            depth = dec_depth
+        )
 
         self.to_recon = Conv3d(dim, channels, 1, bias = False)
 
@@ -190,9 +289,13 @@ class VideoTokenizer(Module):
     ):
         tokens = self.to_encode_tokens(video)
 
+        tokens = rearrange(tokens, 'b d ... -> b ... d')
+
+        tokens = self.encode_transformer(tokens)
+
         latents = self.to_latents(tokens)
 
-        mean, log_var = rearrange(latents, 'b (d mean_var) ... -> mean_var b d ...', mean_var = 2)
+        mean, log_var = rearrange(latents, 'b ... (mean_var d) -> mean_var b ... d', mean_var = 2)
 
         var = log_var.exp()
 
@@ -200,9 +303,13 @@ class VideoTokenizer(Module):
 
     def decode(
         self,
-        latents: Float['b c tl hl wl']
+        latents: Float['b tl hl wl d']
     ):
         tokens = self.to_decode_tokens(latents)
+
+        tokens = self.decode_transformer(tokens)
+
+        tokens = rearrange(tokens, 'b ... d -> b d ...')
 
         recon = self.to_recon(tokens)
 
@@ -275,37 +382,13 @@ class Gaia2(Module):
 
         self.to_tokens = Linear(dim_latent, dim)
 
-        layers = []
-
-        attn_kwargs = dict(
+        self.transformer = Transformer(
             dim = dim,
+            depth = depth,
+            dim_head = dim_head,
             heads = heads,
-            dim_head = dim_head
+            ff_expansion_factor = ff_expansion_factor
         )
-
-        ff_kwargs = dict(
-            dim = dim,
-            expansion_factor = ff_expansion_factor
-        )
-
-        for _ in range(depth):
-
-            space_attn = Attention(**attn_kwargs)
-            time_attn = Attention(**attn_kwargs)
-
-            space_ff = FeedForward(**ff_kwargs)
-            time_ff = FeedForward(**ff_kwargs)
-
-            layers.append(ModuleList([
-                space_attn,
-                space_ff,
-                time_attn,
-                time_ff
-            ]))
-
-        self.layers = ModuleList(layers)
-
-        self.final_norm = nn.RMSNorm(dim)
 
         # flow related
 
@@ -412,42 +495,11 @@ class Gaia2(Module):
 
         tokens = self.to_tokens(data)
 
-        tokens, inv_pack_space = pack_with_inverse(tokens, 'b t * d')
-
-        for (
-            space_attn,
-            space_ff,
-            time_attn,
-            time_ff
-        ) in self.layers:
-
-            # space attention
-
-            tokens, inv_pack_batch = pack_with_inverse(tokens, '* n d')
-
-            tokens = space_attn(tokens) + tokens
-            tokens = space_ff(tokens) + tokens
-
-            tokens = inv_pack_batch(tokens)
-
-            # time attention
-
-            tokens = rearrange(tokens, 'b t n d -> b n t d')
-            tokens, inv_pack_batch = pack_with_inverse(tokens, '* t d')
-
-            tokens = time_attn(tokens) + tokens
-            tokens = time_ff(tokens) + tokens
-
-            tokens = inv_pack_batch(tokens)
-            tokens = rearrange(tokens, 'b n t d -> b t n d')
-
-        tokens = inv_pack_space(tokens)
-
-        tokens = self.final_norm(tokens)
+        attended = self.transformer(tokens)
 
         # flow matching
 
-        pred_flow = self.to_pred_flow(tokens)
+        pred_flow = self.to_pred_flow(attended)
 
         if not return_flow_loss:
             return pred_flow
