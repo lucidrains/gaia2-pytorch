@@ -296,7 +296,7 @@ class Gaia2(Module):
             tokens = rearrange(tokens, 'b t n d -> b n t d')
             tokens, inv_pack_batch = pack_with_inverse(tokens, '* t d')
 
-            tokens = time_ff(tokens) + tokens
+            tokens = time_attn(tokens) + tokens
             tokens = time_ff(tokens) + tokens
 
             tokens = inv_pack_batch(tokens)
