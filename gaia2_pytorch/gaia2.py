@@ -27,6 +27,8 @@ from ema_pytorch import EMA
 # h, w - height width of feature map or video
 # i, j - sequence (source, target)
 # tl, hl, wl - time, height, width of latents feature map
+# nc - sequence length of context tokens cross attended to
+# dc - feature dimension of context tokens
 
 # constants
 
@@ -50,6 +52,9 @@ def log(t, eps = 1e-20):
 
 def l2norm(t):
     return F.normalize(t, dim = -1, p = 2)
+
+def max_neg_value(t):
+    return -torch.finfo(t.dtype).max
 
 def normalize(t, eps = 1e-6):
     shape = t.shape[-1:]
@@ -93,6 +98,7 @@ class Attention(Module):
         self,
         dim,
         *,
+        dim_context = None,
         dim_head = 64,
         heads = 8
     ):
@@ -107,7 +113,10 @@ class Attention(Module):
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
         self.to_q = LinearNoBias(dim, dim_inner)
-        self.to_kv = LinearNoBias(dim, dim_inner * 2)
+
+        dim_kv = default(dim_context, dim)
+        self.to_kv = LinearNoBias(dim_kv, dim_inner * 2)
+
         self.to_out = LinearNoBias(dim_inner, dim)
 
     def forward(
@@ -128,11 +137,16 @@ class Attention(Module):
 
         q = self.to_q(tokens)
 
+        q = q * self.scale
+
         k, v = self.to_kv(kv_tokens).chunk(2, dim = -1)
 
         q, k, v = tuple(self.split_heads(t) for t in (q, k, v))
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
+
+        if exists(context_mask):
+            sim = einx.where('b j, b h i j,', context_mask, sim, max_neg_value(sim))
 
         attn = sim.softmax(dim = -1)
 
@@ -213,12 +227,15 @@ class Transformer(Module):
         dim_head = 64,
         heads = 16,
         ff_expansion_factor = 4.,
-        has_time_attn = True
+        has_time_attn = True,
+        cross_attend = False,
+        dim_cross_attended_tokens = None
     ):
         super().__init__()
 
         space_layers = []
         time_layers = []
+        cross_attn_layers = []
 
         attn_kwargs = dict(
             dim = dim,
@@ -241,29 +258,45 @@ class Transformer(Module):
                 space_ff,
             ]))
 
-            if not has_time_attn:
-                continue
+            if has_time_attn:
 
-            time_attn = Attention(**attn_kwargs)
-            time_ff = FeedForward(**ff_kwargs)
+                time_attn = Attention(**attn_kwargs)
+                time_ff = FeedForward(**ff_kwargs)
 
-            time_layers.append(ModuleList([
-                time_attn,
-                time_ff,
-            ]))
+                time_layers.append(ModuleList([
+                    time_attn,
+                    time_ff,
+                ]))
+
+            if cross_attend:
+                dim_context = default(dim_cross_attended_tokens, dim)
+
+                cross_attn = Attention(**attn_kwargs, dim_context = dim_context)
+                cross_ff = FeedForward(**ff_kwargs)
+
+                cross_attn_layers.append(ModuleList([
+                    cross_attn,
+                    cross_ff
+                ]))
 
         self.space_layers = ModuleList(space_layers)
         self.time_layers = ModuleList(time_layers)
+        self.cross_attn_layers = ModuleList(cross_attn_layers)
 
         self.final_norm = nn.RMSNorm(dim)
 
-    def forward(self, tokens: Float['b tl hl wl d']):
+    def forward(
+        self,
+        tokens: Float['b tl hl wl d'],
+        context: Float['b nc dc'] | None = None,
+        context_mask: Bool['b nc'] | None = None
+    ):
         tokens, inv_pack_space = pack_with_inverse(tokens, 'b t * d')
 
         for (
             space_attn,
             space_ff
-        ), maybe_time_layer in zip_longest(self.space_layers, self.time_layers):
+        ), maybe_time_layer, maybe_cross_attn_layer in zip_longest(self.space_layers, self.time_layers, self.cross_attn_layers):
 
             # space attention
 
@@ -274,21 +307,35 @@ class Transformer(Module):
 
             tokens = inv_pack_batch(tokens)
 
-            if not exists(maybe_time_layer):
-                continue
+            if exists(maybe_time_layer):
 
-            time_attn, time_ff = maybe_time_layer
+                time_attn, time_ff = maybe_time_layer
 
-            # time attention
+                # time attention
 
-            tokens = rearrange(tokens, 'b t n d -> b n t d')
-            tokens, inv_pack_batch = pack_with_inverse(tokens, '* t d')
+                tokens = rearrange(tokens, 'b t n d -> b n t d')
+                tokens, inv_pack_batch = pack_with_inverse(tokens, '* t d')
 
-            tokens = time_attn(tokens) + tokens
-            tokens = time_ff(tokens) + tokens
+                tokens = time_attn(tokens) + tokens
+                tokens = time_ff(tokens) + tokens
 
-            tokens = inv_pack_batch(tokens)
-            tokens = rearrange(tokens, 'b n t d -> b t n d')
+                tokens = inv_pack_batch(tokens)
+                tokens = rearrange(tokens, 'b n t d -> b t n d')
+
+            if exists(context):
+                assert exists(maybe_cross_attn_layer), f'`cross_attend` must be set to True on Transformer to receive context'
+
+                cross_attn, cross_ff = maybe_cross_attn_layer
+
+                # maybe cross attention
+
+                tokens, inv_time_space_pack = pack_with_inverse(tokens, 'b * d')
+
+                tokens = cross_attn(tokens, context = context, context_mask = context_mask) + tokens
+                tokens = cross_ff(tokens) + tokens
+
+                tokens = inv_time_space_pack(tokens)
+
 
         tokens = inv_pack_space(tokens)
 
@@ -433,6 +480,7 @@ class Gaia2(Module):
         depth = 24,
         heads = 16,
         dim_head = 64,
+        dim_context = None,
         ff_expansion_factor = 4.,
         use_logit_norm_distr = True,
         logit_norm_distr = [
@@ -458,7 +506,9 @@ class Gaia2(Module):
             depth = depth,
             dim_head = dim_head,
             heads = heads,
-            ff_expansion_factor = ff_expansion_factor
+            ff_expansion_factor = ff_expansion_factor,
+            dim_cross_attended_tokens = default(dim_context, dim),
+            cross_attend = True
         )
 
         # flow related
@@ -539,6 +589,8 @@ class Gaia2(Module):
     def forward(
         self,
         video_or_latents: Float['b tl hl wl d'] | Float['b c t h w'],
+        context: Float['b nc dc'] | None = None,
+        context_mask: Bool['b nc'] | None = None,
         input_is_video = None,
         return_flow_loss = True
     ):
@@ -598,7 +650,11 @@ class Gaia2(Module):
 
         tokens = self.to_tokens(latents)
 
-        attended = self.transformer(tokens)
+        attended = self.transformer(
+            tokens,
+            context = context,
+            context_mask = context_mask
+        )
 
         # flow matching
 

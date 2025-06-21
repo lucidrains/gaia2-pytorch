@@ -12,15 +12,21 @@ def test_gaia2(
         dim = 32,
         depth = 1,
         heads = 4,
+        dim_context = 55,
         use_logit_norm_distr = use_logit_norm_distr
     )
 
     tokens = torch.randn(2, 8, 16, 16, 77)
 
-    out = model(tokens, return_flow_loss = False)
+    context = torch.randn(2, 32, 55)
+    context_mask = torch.randint(1, 2, (2, 32)).bool()
+
+    context_kwargs = dict(context = context, context_mask = context_mask)
+
+    out = model(tokens, **context_kwargs, return_flow_loss = False)
     assert out.shape == tokens.shape
 
-    loss = model(tokens)
+    loss = model(tokens, **context_kwargs)
     loss.backward()
 
     sampled = model.generate((8, 16, 16), batch_size = 2)
