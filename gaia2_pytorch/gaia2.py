@@ -18,6 +18,8 @@ from einops.layers.torch import Rearrange
 
 from ema_pytorch import EMA
 
+from hyper_connections import get_init_and_expand_reduce_stream_functions
+
 # einstein notation
 
 # b - batch
@@ -112,7 +114,8 @@ class Attention(Module):
         *,
         dim_context = None,
         dim_head = 64,
-        heads = 8
+        heads = 8,
+        use_sdpa = True
     ):
         super().__init__()
 
@@ -129,6 +132,14 @@ class Attention(Module):
 
         self.to_out = LinearNoBias(dim_inner, dim)
 
+        self.to_v_gates = nn.Sequential(
+            LinearNoBias(dim, heads),
+            Rearrange('b n h -> b h n 1'),
+            nn.Sigmoid()
+        )
+
+        self.use_sdpa = use_sdpa
+
     def forward(
         self,
         tokens: Float['b i d'],
@@ -143,22 +154,44 @@ class Attention(Module):
 
         kv_tokens = default(context, tokens)
 
-        q = self.to_q(tokens)
+        # projections
 
-        q = q * self.scale
+        q = self.to_q(tokens)
 
         k, v = self.to_kv(kv_tokens).chunk(2, dim = -1)
 
+        # split heads
+
         q, k, v = tuple(self.split_heads(t) for t in (q, k, v))
 
-        sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
+        if self.use_sdpa:
 
-        if exists(context_mask):
-            sim = einx.where('b j, b h i j,', context_mask, sim, max_neg_value(sim))
+            if exists(context_mask):
+                context_mask = rearrange(context_mask, 'b j -> b 1 1 j')
 
-        attn = sim.softmax(dim = -1)
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                is_causal = False,
+                attn_mask = context_mask
+            )
+        else:
+            q = q * self.scale
 
-        out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+            sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
+
+            if exists(context_mask):
+                sim = einx.where('b j, b h i j,', context_mask, sim, max_neg_value(sim))
+
+            attn = sim.softmax(dim = -1)
+
+            out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+
+        # alphafold-like gating, for attending to nothing
+        # many paper corroborating the need for this by now
+
+        out = out * self.to_v_gates(tokens)
+
+        # merge heads
 
         out = self.merge_heads(out)
 
@@ -166,12 +199,19 @@ class Attention(Module):
 
 # feedforward
 
+class GEGLU(Module):
+    def forward(self, x):
+        x, gates = x.chunk(2, dim = -1)
+        return F.gelu(gates) * x
+
 def FeedForward(dim, expansion_factor = 4.):
+    # glu variant - https://arxiv.org/abs/2002.05202
+
     dim_inner = int(dim * expansion_factor)
 
     return Sequential(
-        Linear(dim, dim_inner),
-        nn.GELU(),
+        Linear(dim, dim_inner * 2),
+        GEGLU(),
         Linear(dim_inner, dim)
     )
 
@@ -307,7 +347,9 @@ class Transformer(Module):
         has_time_attn = True,
         cross_attend = False,
         dim_cross_attended_tokens = None,
-        accept_cond = False
+        accept_cond = False,
+        num_hyperconn_streams = 1,
+        num_hyperconn_fracs = 4    # https://arxiv.org/abs/2503.14125
     ):
         super().__init__()
 
@@ -335,6 +377,13 @@ class Transformer(Module):
         else:
             norm_config = partial(PreNormConfig, dim = dim)
 
+        # prepare hyper connections
+
+        init_hyperconn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_hyperconn_streams, num_fracs = num_hyperconn_fracs, dim = dim)
+
+        def wrap_block(fn):
+            return init_hyperconn(branch = norm_config(fn))
+
         # layers through depth
 
         for _ in range(depth):
@@ -343,8 +392,8 @@ class Transformer(Module):
             space_ff = FeedForward(**ff_kwargs)
 
             space_layers.append(ModuleList([
-                norm_config(space_attn),
-                norm_config(space_ff),
+                wrap_block(space_attn),
+                wrap_block(space_ff),
             ]))
 
             if has_time_attn:
@@ -353,8 +402,8 @@ class Transformer(Module):
                 time_ff = FeedForward(**ff_kwargs)
 
                 time_layers.append(ModuleList([
-                    norm_config(time_attn),
-                    norm_config(time_ff),
+                    wrap_block(time_attn),
+                    wrap_block(time_ff),
                 ]))
 
             if cross_attend:
@@ -364,8 +413,8 @@ class Transformer(Module):
                 cross_ff = FeedForward(**ff_kwargs)
 
                 cross_attn_layers.append(ModuleList([
-                    norm_config(cross_attn),
-                    norm_config(cross_ff)
+                    wrap_block(cross_attn),
+                    wrap_block(cross_ff)
                 ]))
 
         self.space_layers = ModuleList(space_layers)
@@ -390,6 +439,12 @@ class Transformer(Module):
             block_kwargs.update(cond = cond)
 
         tokens, inv_pack_space = pack_with_inverse(tokens, 'b t * d')
+
+        # expand for hyper conns
+
+        tokens = self.expand_streams(tokens)
+
+        # space / time attention layers
 
         for (
             space_attn,
@@ -434,10 +489,16 @@ class Transformer(Module):
 
                 tokens = inv_time_space_pack(tokens)
 
-
         tokens = inv_pack_space(tokens)
 
+        # reduce hyper conn streams
+
+        tokens = self.reduce_streams(tokens)
+
+        # final norm
+
         tokens = self.final_norm(tokens)
+
         return tokens
 
 # video tokenizer
@@ -454,7 +515,9 @@ class VideoTokenizer(Module):
         dim_head = 64,
         heads = 16,
         enc_depth = 2,
-        dec_depth = 2
+        dec_depth = 2,
+        enc_transformer_kwargs: dict = dict(),
+        dec_transformer_kwargs: dict = dict(),
     ):
         super().__init__()
 
@@ -469,7 +532,8 @@ class VideoTokenizer(Module):
             dim_head = dim_head,
             heads = heads,
             depth = enc_depth,
-            has_time_attn = False
+            has_time_attn = False,
+            **enc_transformer_kwargs
         )
 
         # latents
@@ -488,7 +552,8 @@ class VideoTokenizer(Module):
             dim = dim,
             dim_head = dim_head,
             heads = heads,
-            depth = dec_depth
+            depth = dec_depth,
+            **dec_transformer_kwargs
         )
 
         self.to_recon = Conv3d(dim, channels, 1, bias = False)
@@ -590,6 +655,7 @@ class Gaia2(Module):
             rtol = 1e-5,
             method = 'midpoint'
         ),
+        transformer_kwargs: dict = dict()
     ):
         super().__init__()
 
@@ -607,7 +673,8 @@ class Gaia2(Module):
             ff_expansion_factor = ff_expansion_factor,
             dim_cross_attended_tokens = default(dim_context, dim),
             cross_attend = True,
-            accept_cond = True
+            accept_cond = True,
+            **transformer_kwargs
         )
 
         # time conditioning
