@@ -42,6 +42,12 @@ def exists(v):
 def first(arr):
     return arr[0]
 
+def xnor(x, y):
+    return not (x ^ y)
+
+def divisible_by(num, den):
+    return (num % den) == 0
+
 def default(v, d):
     return v if exists(v) else d
 
@@ -52,6 +58,12 @@ def log(t, eps = 1e-20):
 
 def l2norm(t):
     return F.normalize(t, dim = -1, p = 2)
+
+def repeat_batch_to(t, batch):
+    if t.shape[0] >= batch:
+        return t
+
+    return repeat(t, 'b ... -> (b r) ...', r = batch // t.shape[0])
 
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
@@ -107,8 +119,6 @@ class Attention(Module):
         self.scale = dim_head ** -0.5
         dim_inner = dim_head * heads
 
-        self.norm = nn.RMSNorm(dim)
-
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
@@ -132,8 +142,6 @@ class Attention(Module):
         """
 
         kv_tokens = default(context, tokens)
-
-        tokens = self.norm(tokens)
 
         q = self.to_q(tokens)
 
@@ -162,7 +170,6 @@ def FeedForward(dim, expansion_factor = 4.):
     dim_inner = int(dim * expansion_factor)
 
     return Sequential(
-        nn.RMSNorm(dim),
         Linear(dim, dim_inner),
         nn.GELU(),
         Linear(dim_inner, dim)
@@ -216,6 +223,76 @@ class AdaLNZero(Module):
         gamma = self.to_gamma(cond).sigmoid()
         return x * gamma
 
+# conditioning related
+
+class PreNormConfig(Module):
+    def __init__(
+        self,
+        fn: Module,
+        *,
+        dim
+    ):
+        super().__init__()
+        self.fn = fn
+        self.norm = nn.RMSNorm(dim)
+
+    def forward(
+        self,
+        t,
+        *args,
+        **kwargs
+    ):
+        return self.fn(self.norm(t), *args, **kwargs)
+
+class AdaNormConfig(Module):
+    def __init__(
+        self,
+        fn: Module,
+        *,
+        dim,
+        dim_cond = None
+    ):
+        super().__init__()
+        dim_cond = default(dim_cond, dim)
+
+        self.ada_norm = AdaRMSNorm(dim = dim, dim_cond = dim_cond)
+
+        self.fn = fn
+
+        self.ada_ln_zero = AdaLNZero(dim = dim, dim_cond = dim_cond)
+
+    def forward(
+        self,
+        t,
+        *args,
+        cond,
+        **kwargs
+    ):
+        cond = repeat_batch_to(cond, t.shape[0])
+        cond = rearrange(cond, 'b d -> b 1 d')
+
+        t = self.ada_norm(t, cond = cond)
+
+        out = self.fn(t, *args, **kwargs)
+
+        return self.ada_ln_zero(out, cond = cond)
+
+# random projection fourier embedding
+
+class RandomFourierEmbed(Module):
+    def __init__(
+        self,
+        dim
+    ):
+        super().__init__()
+        assert divisible_by(dim, 2)
+        self.register_buffer('weights', torch.randn(dim // 2))
+
+    def forward(self, x):
+        freqs = einx.multiply('i, j -> i j', x, self.weights) * 2 * torch.pi
+        fourier_embed, _ = pack((x, freqs.sin(), freqs.cos()), 'b *')
+        return fourier_embed
+
 # transformer
 
 class Transformer(Module):
@@ -229,7 +306,8 @@ class Transformer(Module):
         ff_expansion_factor = 4.,
         has_time_attn = True,
         cross_attend = False,
-        dim_cross_attended_tokens = None
+        dim_cross_attended_tokens = None,
+        accept_cond = False
     ):
         super().__init__()
 
@@ -248,14 +326,25 @@ class Transformer(Module):
             expansion_factor = ff_expansion_factor
         )
 
+        # if using time conditioning, use the ada-rmsnorm + ada-rms-zero
+
+        self.accept_cond = accept_cond
+
+        if accept_cond:
+            norm_config = partial(AdaNormConfig, dim = dim)
+        else:
+            norm_config = partial(PreNormConfig, dim = dim)
+
+        # layers through depth
+
         for _ in range(depth):
 
             space_attn = Attention(**attn_kwargs)
             space_ff = FeedForward(**ff_kwargs)
 
             space_layers.append(ModuleList([
-                space_attn,
-                space_ff,
+                norm_config(space_attn),
+                norm_config(space_ff),
             ]))
 
             if has_time_attn:
@@ -264,8 +353,8 @@ class Transformer(Module):
                 time_ff = FeedForward(**ff_kwargs)
 
                 time_layers.append(ModuleList([
-                    time_attn,
-                    time_ff,
+                    norm_config(time_attn),
+                    norm_config(time_ff),
                 ]))
 
             if cross_attend:
@@ -275,8 +364,8 @@ class Transformer(Module):
                 cross_ff = FeedForward(**ff_kwargs)
 
                 cross_attn_layers.append(ModuleList([
-                    cross_attn,
-                    cross_ff
+                    norm_config(cross_attn),
+                    norm_config(cross_ff)
                 ]))
 
         self.space_layers = ModuleList(space_layers)
@@ -289,8 +378,17 @@ class Transformer(Module):
         self,
         tokens: Float['b tl hl wl d'],
         context: Float['b nc dc'] | None = None,
-        context_mask: Bool['b nc'] | None = None
+        context_mask: Bool['b nc'] | None = None,
+        cond: Float['b dim_cond'] | None = None
     ):
+        batch = tokens.shape[0]
+        assert xnor(exists(cond), self.accept_cond)
+
+        block_kwargs = dict()
+
+        if exists(cond):
+            block_kwargs.update(cond = cond)
+
         tokens, inv_pack_space = pack_with_inverse(tokens, 'b t * d')
 
         for (
@@ -302,8 +400,8 @@ class Transformer(Module):
 
             tokens, inv_pack_batch = pack_with_inverse(tokens, '* n d')
 
-            tokens = space_attn(tokens) + tokens
-            tokens = space_ff(tokens) + tokens
+            tokens = space_attn(tokens, **block_kwargs) + tokens
+            tokens = space_ff(tokens, **block_kwargs) + tokens
 
             tokens = inv_pack_batch(tokens)
 
@@ -316,8 +414,8 @@ class Transformer(Module):
                 tokens = rearrange(tokens, 'b t n d -> b n t d')
                 tokens, inv_pack_batch = pack_with_inverse(tokens, '* t d')
 
-                tokens = time_attn(tokens) + tokens
-                tokens = time_ff(tokens) + tokens
+                tokens = time_attn(tokens, **block_kwargs) + tokens
+                tokens = time_ff(tokens, **block_kwargs) + tokens
 
                 tokens = inv_pack_batch(tokens)
                 tokens = rearrange(tokens, 'b n t d -> b t n d')
@@ -331,8 +429,8 @@ class Transformer(Module):
 
                 tokens, inv_time_space_pack = pack_with_inverse(tokens, 'b * d')
 
-                tokens = cross_attn(tokens, context = context, context_mask = context_mask) + tokens
-                tokens = cross_ff(tokens) + tokens
+                tokens = cross_attn(tokens, context = context, context_mask = context_mask, **block_kwargs) + tokens
+                tokens = cross_ff(tokens, **block_kwargs) + tokens
 
                 tokens = inv_time_space_pack(tokens)
 
@@ -508,7 +606,16 @@ class Gaia2(Module):
             heads = heads,
             ff_expansion_factor = ff_expansion_factor,
             dim_cross_attended_tokens = default(dim_context, dim),
-            cross_attend = True
+            cross_attend = True,
+            accept_cond = True
+        )
+
+        # time conditioning
+
+        self.to_time_cond = nn.Sequential(
+            RandomFourierEmbed(dim),
+            Linear(dim + 1, dim),
+            nn.SiLU(),
         )
 
         # flow related
@@ -591,6 +698,7 @@ class Gaia2(Module):
         video_or_latents: Float['b tl hl wl d'] | Float['b c t h w'],
         context: Float['b nc dc'] | None = None,
         context_mask: Bool['b nc'] | None = None,
+        times: Float['b'] | Float[''] | None = None,
         input_is_video = None,
         return_flow_loss = True
     ):
@@ -617,7 +725,8 @@ class Gaia2(Module):
         # flow matching is easy
         # you just noise some random amount and store the flow as data - noise, then force it to predict that velocity
 
-        if return_flow_loss:
+        if not exists(times):
+
             time_shape = (batch,)
 
             if self.use_logit_norm_distr:
@@ -643,8 +752,15 @@ class Gaia2(Module):
 
             flow = latents - noise
 
-            times = rearrange(times, 'b -> b 1 1 1 1')
-            tokens = noise.lerp(latents, times) # read as (noise * (1. - time) + data * time)
+            padded_times = rearrange(times, 'b -> b 1 1 1 1')
+            tokens = noise.lerp(latents, padded_times) # read as (noise * (1. - time) + data * time)
+
+        # handle time conditioning
+
+        if times.ndim == 0:
+            times = repeat(times, '-> b', b = batch)
+
+        cond = self.to_time_cond(times)
 
         # transformer
 
@@ -652,6 +768,7 @@ class Gaia2(Module):
 
         attended = self.transformer(
             tokens,
+            cond = cond,
             context = context,
             context_mask = context_mask
         )
@@ -664,4 +781,3 @@ class Gaia2(Module):
             return pred_flow
 
         return F.mse_loss(pred_flow, flow)
-
