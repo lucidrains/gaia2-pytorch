@@ -207,7 +207,7 @@ class GEGLU(Module):
 def FeedForward(dim, expansion_factor = 4.):
     # glu variant - https://arxiv.org/abs/2002.05202
 
-    dim_inner = int(dim * expansion_factor)
+    dim_inner = int(dim * expansion_factor * 2 / 3)
 
     return Sequential(
         Linear(dim, dim_inner * 2),
