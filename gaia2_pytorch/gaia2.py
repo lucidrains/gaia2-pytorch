@@ -668,6 +668,7 @@ class Gaia2(Module):
 
             pred_flow = self.forward(
                 denoised,
+                times = step_times,
                 return_flow_loss = False,
                 input_is_video = False
             )
