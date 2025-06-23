@@ -890,7 +890,8 @@ class Gaia2(Module):
         self,
         video_shape: tuple[int, int, int], # (time, height, width)
         batch_size = 1,
-        steps = 16
+        steps = 16,
+        cond_scale = 3.
     ) -> (
         Float['b tl hl wl d'] |
         Float['b c t h w']
@@ -900,9 +901,10 @@ class Gaia2(Module):
 
         def fn(step_times, denoised):
 
-            pred_flow = self.forward(
+            pred_flow = self.forward_cfg(
                 denoised,
                 times = step_times,
+                cond_scale = cond_scale,
                 return_flow_loss = False,
                 input_is_video = False
             )
@@ -927,6 +929,26 @@ class Gaia2(Module):
 
         video = self.tokenizer.decode(sampled_latents)
         return video
+
+    @torch.no_grad()
+    def forward_cfg(
+        self,
+        *args,
+        return_flow_loss = False,
+        cond_scale = 3.,
+        **kwargs,
+    ):
+        assert not return_flow_loss
+
+        pred_flow = self.forward(*args, **kwargs, cross_attn_dropout = False, return_flow_loss = False)
+
+        if cond_scale == 1.:
+            return pred_flow
+
+        null_pred_flow = self.forward(*args, **kwargs, cross_attn_dropout = True, return_flow_loss = False)
+
+        update = pred_flow - null_pred_flow
+        return pred_flow + update * (cond_scale - 1.)
 
     def forward(
         self,
