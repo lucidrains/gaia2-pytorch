@@ -30,12 +30,13 @@ from hyper_connections import get_init_and_expand_reduce_stream_functions
 # einstein notation
 
 # b - batch
+# h - attention heads
 # n - sequence
 # d - feature dimension
 # t - time
-# h, w - height width of feature map or video
+# vh, vw - height width of feature map or video
 # i, j - sequence (source, target)
-# tl, hl, wl - time, height, width of latents feature map
+# tl, vhl, vwl - time, height, width of latents feature map
 # nc - sequence length of context tokens cross attended to
 # dc - feature dimension of context tokens
 
@@ -552,7 +553,7 @@ class LPIPSLoss(Module):
         vgg, device, orig_device = self.vgg, video.device, module_device(self.vgg)
         vgg.to(device)
 
-        video, recon_video = tuple(rearrange(t, 'b c t h w -> (b t) c h w') for t in (video, recon_video))
+        video, recon_video = tuple(rearrange(t, 'b c t vh vw -> (b t) c vh vw') for t in (video, recon_video))
 
         video, recon_video = tuple(self.resize(t) for t in (video, recon_video))
 
@@ -610,14 +611,14 @@ class ReconDiscriminator(Module):
 
     def forward(
         self,
-        recon_videos: Float['b c t h w'],
-        real_videos: Float['b c t h w'] | None = None
+        recon_videos: Float['b c t vh vw'],
+        real_videos: Float['b c t vh vw'] | None = None
     ):
 
         is_discr_loss = exists(real_videos)
 
         if is_discr_loss:
-            videos, inverse_pack_fake_real = pack_with_inverse((real_videos, recon_videos), '* c t h w')
+            videos, inverse_pack_fake_real = pack_with_inverse((real_videos, recon_videos), '* c t vh vw')
         else:
             videos = recon_videos
 
@@ -929,7 +930,7 @@ class Gaia2(Module):
 
     def forward(
         self,
-        video_or_latents: Float['b tl hl wl d'] | Float['b c t h w'],
+        video_or_latents: Float['b tl vhl vwl d'] | Float['b c t vh vw'],
         context: Float['b nc dc'] | None = None,
         context_mask: Bool['b nc'] | None = None,
         times: Float['b'] | Float[''] | None = None,
