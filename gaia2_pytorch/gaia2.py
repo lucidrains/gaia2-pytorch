@@ -12,6 +12,10 @@ from torch.distributions import Normal, Categorical, kl_divergence
 
 from torchdiffeq import odeint
 
+import torchvision
+from torchvision.transforms import Resize
+import torchvision.models as vision_models
+
 import einx
 from einops import rearrange, repeat, pack, unpack, einsum
 from einops.layers.torch import Rearrange
@@ -52,6 +56,9 @@ def divisible_by(num, den):
 
 def default(v, d):
     return v if exists(v) else d
+
+def module_device(m: Module):
+    return next(m.parameters()).device
 
 # tensor helpers
 
@@ -501,6 +508,50 @@ class Transformer(Module):
 
         return tokens
 
+# tokenizer modules
+
+class LPIPSLoss(Module):
+    def __init__(
+        self,
+        vgg: Module | None = None,
+        vgg_input_image_shape = (224, 224),
+        vgg_weights: vision_models.VGG16_Weights = vision_models.VGG16_Weights.DEFAULT,
+        vgg_device = None
+    ):
+        super().__init__()
+
+        self.resize = Resize(vgg_input_image_shape, antialias = True)
+
+        if not exists(vgg):
+            vgg = vision_models.vgg16(weights = vgg_weights)
+            vgg.classifier = nn.Sequential(*vgg.classifier[:-2])
+
+        if exists(vgg_device):
+            vgg.to(vgg_device)
+
+        self._vgg = [vgg]
+
+    @property
+    def vgg(self):
+        return first(self._vgg)
+
+    def forward(
+        self,
+        video,
+        recon_video
+    ):
+        vgg, device, orig_device = self.vgg, video.device, module_device(self.vgg)
+        vgg.to(device)
+
+        video, recon_video = tuple(rearrange(t, 'b c t h w -> (b t) c h w') for t in (video, recon_video))
+
+        video, recon_video = tuple(self.resize(t) for t in (video, recon_video))
+
+        recon_vgg_embed, vgg_embed = map(vgg, (recon_video, video))
+
+        vgg.to(orig_device)
+        return F.mse_loss(vgg_embed, recon_vgg_embed)
+
 # video tokenizer
 
 class VideoTokenizer(Module):
@@ -511,13 +562,15 @@ class VideoTokenizer(Module):
         dim = 512,
         dim_latent = 64, # they do a really small latent dimension, claims this brings about improvements
         eps = 1e-6,
-        latent_loss_weight = 1.,
         dim_head = 64,
         heads = 16,
         enc_depth = 2,
         dec_depth = 2,
         enc_transformer_kwargs: dict = dict(),
         dec_transformer_kwargs: dict = dict(),
+        lpips_loss_kwargs: dict = dict(),
+        latent_loss_weight = 1.,
+        lpips_loss_weight = 1.
     ):
         super().__init__()
 
@@ -557,6 +610,12 @@ class VideoTokenizer(Module):
         )
 
         self.to_recon = Conv3d(dim, channels, 1, bias = False)
+
+        # loss related
+
+        self.lpips = LPIPSLoss()
+
+        self.lpips_loss_weight = lpips_loss_weight
 
     def encode(
         self,
@@ -616,13 +675,16 @@ class VideoTokenizer(Module):
 
         recon_loss = F.mse_loss(orig_video, recon)
 
+        lpips_loss = self.lpips(orig_video, recon)
+
         latent_loss = kl_divergence(latent_normal_distr, self.gaussian).mean()
 
-        breakdown = (recon_loss, latent_loss)
+        breakdown = (recon_loss, lpips_loss, latent_loss)
 
         total_loss = (
             recon_loss + 
-            latent_loss * self.latent_loss_weight
+            latent_loss * self.latent_loss_weight +
+            lpips_loss * self.lpips_loss_weight
         )
 
         if not return_breakdown:
