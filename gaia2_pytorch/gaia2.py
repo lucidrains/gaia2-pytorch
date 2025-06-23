@@ -360,7 +360,8 @@ class Transformer(Module):
         dim_cross_attended_tokens = None,
         accept_cond = False,
         num_hyperconn_streams = 1,
-        num_hyperconn_fracs = 4    # https://arxiv.org/abs/2503.14125
+        num_hyperconn_fracs = 4,    # Zhu et al. https://arxiv.org/abs/2503.14125
+        num_register_tokens = 16    # Darcet et al. https://arxiv.org/abs/2309.16588 
     ):
         super().__init__()
 
@@ -394,6 +395,15 @@ class Transformer(Module):
 
         def wrap_block(fn):
             return init_hyperconn(branch = norm_config(fn))
+
+        # register tokens
+
+        self.registers_space = nn.Parameter(torch.randn(num_register_tokens, dim) * 1e-2)
+
+        if has_time_attn:
+            self.registers_time = nn.Parameter(torch.randn(num_register_tokens, dim) * 1e-2)
+
+        self.has_time_attn = has_time_attn
 
         # layers through depth
 
@@ -442,7 +452,7 @@ class Transformer(Module):
         cond: Float['b dim_cond'] | None = None,
         cross_attn_dropout: Bool['b'] | None = None
     ):
-        batch = tokens.shape[0]
+        batch, time, height, width, _ = tokens.shape
         assert xnor(exists(cond), self.accept_cond)
 
         block_kwargs = dict()
@@ -456,6 +466,13 @@ class Transformer(Module):
 
         tokens = self.expand_streams(tokens)
 
+        # register tokens
+
+        registers_space = repeat(self.registers_space, 'n d -> b n d', b = batch * time)
+
+        if self.has_time_attn:
+            registers_time = repeat(self.registers_time, 'n d -> b n d', b = batch * height * width)
+
         # space / time attention layers
 
         for (
@@ -467,8 +484,12 @@ class Transformer(Module):
 
             tokens, inv_pack_batch = pack_with_inverse(tokens, '* n d')
 
+            tokens, inv_pack_registers = pack_with_inverse((registers_space, tokens), 'b * d')
+
             tokens = space_attn(tokens, **block_kwargs)
             tokens = space_ff(tokens, **block_kwargs)
+
+            registers_space, tokens = inv_pack_registers(tokens)
 
             tokens = inv_pack_batch(tokens)
 
@@ -481,8 +502,12 @@ class Transformer(Module):
                 tokens = rearrange(tokens, 'b t n d -> b n t d')
                 tokens, inv_pack_batch = pack_with_inverse(tokens, '* t d')
 
+                tokens, inv_pack_registers = pack_with_inverse((registers_time, tokens), 'b * d')
+
                 tokens = time_attn(tokens, **block_kwargs)
                 tokens = time_ff(tokens, **block_kwargs)
+
+                registers_time, tokens = inv_pack_registers(tokens)
 
                 tokens = inv_pack_batch(tokens)
                 tokens = rearrange(tokens, 'b n t d -> b t n d')

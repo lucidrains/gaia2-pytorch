@@ -91,3 +91,12 @@ That's it
     url     = {https://api.semanticscholar.org/CorpusID:275405495}
 }
 ```
+
+```bibtex
+@inproceedings{Darcet2023VisionTN,
+    title   = {Vision Transformers Need Registers},
+    author  = {Timoth'ee Darcet and Maxime Oquab and Julien Mairal and Piotr Bojanowski},
+    year    = {2023},
+    url     = {https://api.semanticscholar.org/CorpusID:263134283}
+}
+```
