@@ -6,6 +6,7 @@ from itertools import zip_longest
 
 import torch
 import torch.nn.functional as F
+from torch.autograd import grad as torch_grad
 from torch import nn, cat, stack, tensor, is_tensor
 from torch.nn import Module, ModuleList, Linear, Conv3d, Sequential
 from torch.distributions import Normal, Categorical, kl_divergence
@@ -14,7 +15,9 @@ from torchdiffeq import odeint
 
 import torchvision
 from torchvision.transforms import Resize
+
 import torchvision.models as vision_models
+VGG16_Weights = vision_models.VGG16_Weights
 
 import einx
 from einops import rearrange, repeat, pack, unpack, einsum
@@ -515,7 +518,7 @@ class LPIPSLoss(Module):
         self,
         vgg: Module | None = None,
         vgg_input_image_shape = (224, 224),
-        vgg_weights: vision_models.VGG16_Weights = vision_models.VGG16_Weights.DEFAULT,
+        vgg_weights: VGG16_Weights = VGG16_Weights.DEFAULT,
         vgg_device = None
     ):
         super().__init__()
@@ -552,6 +555,76 @@ class LPIPSLoss(Module):
         vgg.to(orig_device)
         return F.mse_loss(vgg_embed, recon_vgg_embed)
 
+# adversarial loss related
+# should abstract this into a library at some point
+
+def gradient_penalty(
+    images,
+    output,
+    center = 0. # recent paper claims to have solved GAN stability issues with zero mean gp penalty "Gan is dead paper"
+):
+    gradients = first(torch_grad(
+        outputs = output,
+        inputs = images,
+        grad_outputs = torch.ones_like(output),
+        create_graph = True,
+        retain_graph = True,
+        only_inputs = True
+    ))
+
+    gradients = rearrange(gradients, 'b ... -> b (...)')
+    return ((gradients.norm(2, dim = 1) - center) ** 2).mean()
+
+def hinge_discr_loss(fake, real):
+    return (F.relu(1 + fake) + F.relu(1 - real)).mean()
+
+def hinge_gen_loss(fake):
+    return -fake.mean()
+
+class ReconDiscriminator(Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        channels = 3,
+        depth = 4,
+        activation = nn.LeakyReLU(0.1)
+    ):
+        super().__init__()
+
+        self.net = Sequential(
+            Conv3d(channels, dim, 7, 3, padding = 1),
+            activation,
+            *[Sequential(
+                Conv3d(dim, dim, 3, 2, 1),
+                activation
+            ) for _ in range(depth)],
+            Conv3d(dim, 1, 1),
+        )
+
+    def forward(
+        self,
+        recon_videos: Float['b c t h w'],
+        real_videos: Float['b c t h w'] | None = None
+    ):
+
+        is_discr_loss = exists(real_videos)
+
+        if is_discr_loss:
+            videos, inverse_pack_fake_real = pack_with_inverse((real_videos, recon_videos), '* c t h w')
+        else:
+            videos = recon_videos
+
+        logits = self.net(videos)
+
+        if is_discr_loss:
+            fake_videos, real_videos = inverse_pack_fake_real(logits)
+            loss = hinge_discr_loss(fake_videos, real_videos)
+        else:
+            loss = hinge_gen_loss(logits)
+
+        return loss
+
 # video tokenizer
 
 class VideoTokenizer(Module):
@@ -570,7 +643,8 @@ class VideoTokenizer(Module):
         dec_transformer_kwargs: dict = dict(),
         lpips_loss_kwargs: dict = dict(),
         latent_loss_weight = 1.,
-        lpips_loss_weight = 1.
+        lpips_loss_weight = 1.,
+        adversarial_gen_loss_weight = 1.
     ):
         super().__init__()
 
@@ -617,6 +691,10 @@ class VideoTokenizer(Module):
 
         self.lpips_loss_weight = lpips_loss_weight
 
+        self.adversarial_gen_loss_weight = adversarial_gen_loss_weight
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
     def encode(
         self,
         video: Float['b c t h w'],
@@ -656,6 +734,8 @@ class VideoTokenizer(Module):
     def forward(
         self,
         video: Float['b c t h w'],
+        recon_discr: ReconDiscriminator | Module | None = None,
+        return_discr_loss = False,
         return_breakdown = False,
         return_recon_only = False
     ):
@@ -670,6 +750,12 @@ class VideoTokenizer(Module):
 
         recon = self.decode(sampled_latents)
 
+        if return_discr_loss:
+            assert exists(recon_discr)
+
+            adv_discr_loss = recon_discr(recon, orig_video)
+            return adv_discr_loss
+
         if return_recon_only:
             return recon
 
@@ -679,12 +765,18 @@ class VideoTokenizer(Module):
 
         latent_loss = kl_divergence(latent_normal_distr, self.gaussian).mean()
 
-        breakdown = (recon_loss, lpips_loss, latent_loss)
+        adv_gen_loss = self.zero
+
+        if exists(recon_discr):
+            adv_gen_loss = recon_discr(recon)
+
+        breakdown = (recon_loss, lpips_loss, latent_loss, adv_gen_loss)
 
         total_loss = (
             recon_loss + 
             latent_loss * self.latent_loss_weight +
-            lpips_loss * self.lpips_loss_weight
+            lpips_loss * self.lpips_loss_weight + 
+            adv_gen_loss * self.adversarial_gen_loss_weight
         )
 
         if not return_breakdown:
