@@ -41,3 +41,21 @@ def test_tokenizer():
 
     loss = tokenizer(video)
     loss.backward()
+
+def test_optional_adversarial_loss():
+    from gaia2_pytorch.gaia2 import VideoTokenizer, ReconDiscriminator
+
+    video = torch.randn(1, 3, 10, 16, 16)
+
+    tokenizer = VideoTokenizer(enc_depth = 1, dec_depth = 1)
+
+    discr = ReconDiscriminator(dim = 32, depth = 2)
+
+    discr_loss = tokenizer(video, recon_discr = discr, return_discr_loss = True)
+    discr_loss.backward()
+
+    loss = tokenizer(video, recon_discr = discr)
+    loss.backward()
+
+    loss = tokenizer(video)
+    loss.backward()
