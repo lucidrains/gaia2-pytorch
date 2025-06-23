@@ -438,7 +438,8 @@ class Transformer(Module):
         tokens: Float['b tl hl wl d'],
         context: Float['b nc dc'] | None = None,
         context_mask: Bool['b nc'] | None = None,
-        cond: Float['b dim_cond'] | None = None
+        cond: Float['b dim_cond'] | None = None,
+        cross_attn_dropout: Bool['b'] | None = None
     ):
         batch = tokens.shape[0]
         assert xnor(exists(cond), self.accept_cond)
@@ -465,8 +466,8 @@ class Transformer(Module):
 
             tokens, inv_pack_batch = pack_with_inverse(tokens, '* n d')
 
-            tokens = space_attn(tokens, **block_kwargs) + tokens
-            tokens = space_ff(tokens, **block_kwargs) + tokens
+            tokens = space_attn(tokens, **block_kwargs)
+            tokens = space_ff(tokens, **block_kwargs)
 
             tokens = inv_pack_batch(tokens)
 
@@ -479,8 +480,8 @@ class Transformer(Module):
                 tokens = rearrange(tokens, 'b t n d -> b n t d')
                 tokens, inv_pack_batch = pack_with_inverse(tokens, '* t d')
 
-                tokens = time_attn(tokens, **block_kwargs) + tokens
-                tokens = time_ff(tokens, **block_kwargs) + tokens
+                tokens = time_attn(tokens, **block_kwargs)
+                tokens = time_ff(tokens, **block_kwargs)
 
                 tokens = inv_pack_batch(tokens)
                 tokens = rearrange(tokens, 'b n t d -> b t n d')
@@ -492,12 +493,17 @@ class Transformer(Module):
 
                 # maybe cross attention
 
-                tokens, inv_time_space_pack = pack_with_inverse(tokens, 'b * d')
+                cross_attn_tokens, inv_time_space_pack = pack_with_inverse(tokens, 'b * d')
 
-                tokens = cross_attn(tokens, context = context, context_mask = context_mask, **block_kwargs) + tokens
-                tokens = cross_ff(tokens, **block_kwargs) + tokens
+                cross_attn_tokens = cross_attn(cross_attn_tokens, context = context, context_mask = context_mask, **block_kwargs)
+                cross_attn_tokens = cross_ff(cross_attn_tokens, **block_kwargs)
 
-                tokens = inv_time_space_pack(tokens)
+                cross_attn_tokens = inv_time_space_pack(cross_attn_tokens)
+
+                if exists(cross_attn_dropout):
+                    tokens = einx.where('b, b ..., b ...', cross_attn_dropout, tokens, cross_attn_tokens)
+                else:
+                    tokens = cross_attn_tokens
 
         tokens = inv_pack_space(tokens)
 
@@ -800,6 +806,7 @@ class Gaia2(Module):
         dim_context = None,
         ff_expansion_factor = 4.,
         use_logit_norm_distr = True,
+        context_dropout_prob = 0.25, # for classifier free guidance, Ho et al.
         logit_norm_distr = [
             (.8, (.5, 1.4)),
             (.2, (-3., 1.))
@@ -838,6 +845,11 @@ class Gaia2(Module):
             Linear(dim + 1, dim),
             nn.SiLU(),
         )
+
+        # action / conditioning - classifier free guidance
+        # consider the newer improved cfg paper if circumstances allows
+
+        self.context_dropout_prob = context_dropout_prob
 
         # flow related
 
@@ -922,7 +934,8 @@ class Gaia2(Module):
         context_mask: Bool['b nc'] | None = None,
         times: Float['b'] | Float[''] | None = None,
         input_is_video = None,
-        return_flow_loss = True
+        return_flow_loss = True,
+        cross_attn_dropout: bool | Bool['b'] | None = None
     ):
 
         # if tokenizer is added, assume is video
@@ -984,6 +997,15 @@ class Gaia2(Module):
 
         cond = self.to_time_cond(times)
 
+        # classifier free guidance
+
+        if isinstance(cross_attn_dropout, bool):
+            cross_attn_dropout = tensor(cross_attn_dropout, device = device)
+            cross_attn_dropout = repeat(cross_attn_dropout, ' -> b ', b = batch)
+
+        if not exists(cross_attn_dropout):
+            cross_attn_dropout = torch.rand(batch, device = device) < self.context_dropout_prob
+
         # transformer
 
         tokens = self.to_tokens(latents)
@@ -992,7 +1014,8 @@ class Gaia2(Module):
             tokens,
             cond = cond,
             context = context,
-            context_mask = context_mask
+            context_mask = context_mask,
+            cross_attn_dropout = cross_attn_dropout
         )
 
         # flow matching
