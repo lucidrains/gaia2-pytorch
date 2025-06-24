@@ -100,3 +100,15 @@ That's it
     url     = {https://api.semanticscholar.org/CorpusID:263134283}
 }
 ```
+
+```bibtex
+@misc{chen2025deepcompressionautoencoderefficient,
+    title   = {Deep Compression Autoencoder for Efficient High-Resolution Diffusion Models},
+    author  = {Junyu Chen and Han Cai and Junsong Chen and Enze Xie and Shang Yang and Haotian Tang and Muyang Li and Yao Lu and Song Han},
+    year    = {2025},
+    eprint  = {2410.10733},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV},
+    url     = {https://arxiv.org/abs/2410.10733},
+}
+```

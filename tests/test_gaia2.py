@@ -62,3 +62,15 @@ def test_optional_adversarial_loss():
 
     loss = tokenizer(video)
     loss.backward()
+
+def test_residual_down_up_sample():
+    from gaia2_pytorch.gaia2 import ResidualDownsample, ResidualUpsample
+
+    latents = torch.randn(1, 10, 16, 16, 32)
+    down = ResidualDownsample(32, space = True)
+    up = ResidualUpsample(32 * 2, space = True)
+    assert up(down(latents)).shape == latents.shape
+
+    down = ResidualDownsample(32, time = True)
+    up = ResidualUpsample(32 * 2, time = True)
+    assert up(down(latents)).shape == latents.shape

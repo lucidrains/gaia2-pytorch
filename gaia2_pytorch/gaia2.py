@@ -20,8 +20,8 @@ import torchvision.models as vision_models
 VGG16_Weights = vision_models.VGG16_Weights
 
 import einx
-from einops import rearrange, repeat, pack, unpack, einsum
-from einops.layers.torch import Rearrange
+from einops import rearrange, repeat, reduce, pack, unpack, einsum
+from einops.layers.torch import Rearrange, Reduce
 
 from ema_pytorch import EMA
 
@@ -663,6 +663,91 @@ class ReconDiscriminator(Module):
             return loss
 
         return loss, logits
+
+# residual down / up sampling - as proposed in https://arxiv.org/abs/2410.10733v1
+# section 3.2
+
+class ResidualDownsample(Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        space = False,
+        time = False,
+        channel_reduce_factor = None
+    ):
+        super().__init__()
+        assert space or time
+
+        space_factor = 2 if space else 1
+        time_factor = 2 if time else 1
+        channel_reduce_factor = default(channel_reduce_factor, space_factor)
+
+        self.channel_reduce_factor = channel_reduce_factor
+
+        self.to_residual = Rearrange(
+            'b (t ft) (h fsh) (w fsw) d -> b t h w (ft fsh fsw d)',
+            ft = time_factor,
+            fsh = space_factor,
+            fsw = space_factor,
+        )
+
+        dim_in = dim * (time_factor * space_factor ** 2)
+        dim_out = dim_in // channel_reduce_factor
+
+        self.proj = nn.Linear(dim_in, dim_out)
+
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(
+        self,
+        feats: Float['b vt vhl vwl d']
+    ):
+        residual = self.to_residual(feats)
+        channel_reduced_residual = reduce(residual, '... (r d) -> ... d', 'mean', r = self.channel_reduce_factor)
+        return channel_reduced_residual + self.proj(residual)
+
+class ResidualUpsample(Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        space = False,
+        time = False,
+        repeat_channels = None
+    ):
+        super().__init__()
+        assert space or time
+        space_factor = 2 if space else 1
+        time_factor = 2 if time else 1
+        repeat_factor = default(repeat_channels, space_factor)
+
+        self.repeat_factor = repeat_factor
+
+        self.to_residual = Rearrange('b t h w (ft fsh fsw d) -> b (t ft) (h fsh) (w fsw) d',
+            ft = time_factor,
+            fsh = space_factor,
+            fsw = space_factor,
+        )
+
+        dim_out = dim * repeat_factor
+
+        self.proj = Linear(dim, dim_out)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(
+        self,
+        feats: Float['b tl vhl vwl d']
+    ):
+        residual = self.to_residual(feats)
+        channel_expanded_residual = repeat(residual, '... d -> ... (r d)', r = self.repeat_factor)
+
+        learned_residual = self.proj(feats)
+        learned_residual = self.to_residual(learned_residual)
+
+        return channel_expanded_residual + learned_residual
 
 # video tokenizer
 
