@@ -4,8 +4,6 @@
 
 Implementation of the [world model architecture](https://arxiv.org/abs/2503.20523) proposed for the domain of self driving out of Wayve
 
-Please let me know your thoughts of the paper [here](https://discord.gg/na5MQBUJqb), positive or negative, so I can gauge its significance / prioritize
-
 ## Install
 
 ```bash
