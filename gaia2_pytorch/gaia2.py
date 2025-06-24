@@ -619,7 +619,7 @@ class ReconDiscriminator(Module):
         *,
         dim,
         channels = 3,
-        depth = 4,
+        depth = 2,
         activation = nn.LeakyReLU(0.1)
     ):
         super().__init__()
@@ -637,25 +637,30 @@ class ReconDiscriminator(Module):
     def forward(
         self,
         recon_videos: Float['b c t vh vw'],
-        real_videos: Float['b c t vh vw'] | None = None
+        real_videos: Float['b c t vh vw'] | None = None,
+        return_logits = False
     ):
 
         is_discr_loss = exists(real_videos)
 
         if is_discr_loss:
-            videos, inverse_pack_fake_real = pack_with_inverse((real_videos, recon_videos), '* c t vh vw')
+            videos, inverse_pack_fake_real = pack_with_inverse((recon_videos, real_videos), '* c t vh vw')
         else:
             videos = recon_videos
 
         logits = self.net(videos)
 
         if is_discr_loss:
-            fake_videos, real_videos = inverse_pack_fake_real(logits)
-            loss = hinge_discr_loss(fake_videos, real_videos)
+            logits = inverse_pack_fake_real(logits)
+            fake_logits, real_logits = logits
+            loss = hinge_discr_loss(fake_logits, real_logits)
         else:
             loss = hinge_gen_loss(logits)
 
-        return loss
+        if not return_logits:
+            return loss
+
+        return loss, logits
 
 # video tokenizer
 
@@ -769,7 +774,8 @@ class VideoTokenizer(Module):
         recon_discr: ReconDiscriminator | Module | None = None,
         return_discr_loss = False,
         return_breakdown = False,
-        return_recon_only = False
+        return_recon_only = False,
+        apply_grad_penalty = True
     ):
 
         orig_video = video
@@ -785,8 +791,34 @@ class VideoTokenizer(Module):
         if return_discr_loss:
             assert exists(recon_discr)
 
-            adv_discr_loss = recon_discr(recon, orig_video)
-            return adv_discr_loss
+            recon = recon.detach().clone()
+
+            # maybe gradient penalty
+
+            if apply_grad_penalty:
+                recon.requires_grad_()
+                orig_video.requires_grad_()
+
+            # discriminator loss
+
+            adv_discr_loss, (fake_logits, real_logits) = recon_discr(recon, orig_video, return_logits = True)
+
+            gp_loss = self.zero
+
+            if apply_grad_penalty:
+                gp_loss = gradient_penalty(recon, fake_logits) + gradient_penalty(orig_video, real_logits)
+
+            breakdown = (adv_discr_loss, gp_loss)
+
+            total_loss = (
+                adv_discr_loss +
+                gp_loss
+            )
+
+            if not return_breakdown:
+                return total_loss
+
+            return total_loss, breakdown
 
         if return_recon_only:
             return recon

@@ -32,14 +32,17 @@ def test_gaia2(
     sampled = model.generate((8, 16, 16), batch_size = 2)
     assert sampled.shape == tokens.shape
 
-def test_tokenizer():
+@pytest.mark.parametrize('apply_grad_penalty', (False, True))
+def test_tokenizer(
+    apply_grad_penalty
+):
     from gaia2_pytorch.gaia2 import VideoTokenizer
 
     video = torch.randn(1, 3, 10, 16, 16)
 
     tokenizer = VideoTokenizer()
 
-    loss = tokenizer(video)
+    loss = tokenizer(video, apply_grad_penalty = apply_grad_penalty)
     loss.backward()
 
 def test_optional_adversarial_loss():
