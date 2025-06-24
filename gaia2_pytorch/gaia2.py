@@ -27,6 +27,8 @@ from ema_pytorch import EMA
 
 from hyper_connections import get_init_and_expand_reduce_stream_functions
 
+from rotary_embedding_torch import RotaryEmbedding
+
 # einstein notation
 
 # b - batch

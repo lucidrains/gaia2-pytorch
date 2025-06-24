@@ -28,11 +28,12 @@ dependencies = [
     "einx>=0.3.0",
     "einops>=0.8.1",
     "ema-pytorch",
+    "jaxtyping",
     "hyper-connections>=0.2.1",
+    "rotary-embedding-torch",
     "torch>=2.4",
     "torchdiffeq",
     "torchvision",
-    "jaxtyping"
 ]
 
 [project.urls]
