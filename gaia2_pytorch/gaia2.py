@@ -704,8 +704,9 @@ class ResidualDownsample(Module):
         self,
         feats: Float['b vt vhl vwl d']
     ):
+        orig_dim = feats.shape[-1]
         residual = self.to_residual(feats)
-        channel_reduced_residual = reduce(residual, '... (r d) -> ... d', 'mean', r = self.channel_reduce_factor)
+        channel_reduced_residual = reduce(residual, '... (fst r d) -> ... (fst d)', 'mean', r = self.channel_reduce_factor, d = orig_dim)
         return channel_reduced_residual + self.proj(residual)
 
 class ResidualUpsample(Module):
