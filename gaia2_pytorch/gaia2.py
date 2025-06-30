@@ -7,7 +7,7 @@ from itertools import zip_longest
 import torch
 import torch.nn.functional as F
 from torch.autograd import grad as torch_grad
-from torch import nn, cat, stack, tensor, is_tensor
+from torch import nn, cat, stack, arange, tensor, is_tensor
 from torch.nn import Module, ModuleList, Linear, Conv3d, Sequential
 from torch.distributions import Normal, Categorical, kl_divergence
 
@@ -27,7 +27,7 @@ from ema_pytorch import EMA
 
 from hyper_connections import get_init_and_expand_reduce_stream_functions
 
-from rotary_embedding_torch import RotaryEmbedding
+from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 
 # einstein notation
 
@@ -157,7 +157,8 @@ class Attention(Module):
         self,
         tokens: Float['b i d'],
         context: Float['b j d'] | None = None,
-        context_mask: Bool['b j'] | None = None
+        context_mask: Bool['b j'] | None = None,
+        rotary_emb = None
     ):
         """
         q - queries
@@ -176,6 +177,11 @@ class Attention(Module):
         # split heads
 
         q, k, v = tuple(self.split_heads(t) for t in (q, k, v))
+
+        # maybe rotary
+
+        if exists(rotary_emb):
+            q, k = tuple(apply_rotary_emb(rotary_emb, t) for t in (q, k))
 
         if self.use_sdpa:
 
@@ -391,6 +397,10 @@ class Transformer(Module):
         else:
             norm_config = partial(PreNormConfig, dim = dim)
 
+        # prepare rotary embeddings
+
+        self.rotary_emb_time = RotaryEmbedding(dim_head // 2)
+
         # prepare hyper connections
 
         init_hyperconn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_hyperconn_streams, num_fracs = num_hyperconn_fracs, dim = dim)
@@ -399,6 +409,8 @@ class Transformer(Module):
             return init_hyperconn(branch = norm_config(fn))
 
         # register tokens
+
+        self.num_register_tokens = num_register_tokens
 
         self.registers_space = nn.Parameter(torch.randn(num_register_tokens, dim) * 1e-2)
 
@@ -454,7 +466,7 @@ class Transformer(Module):
         cond: Float['b dim_cond'] | None = None,
         cross_attn_dropout: Bool['b'] | None = None
     ):
-        batch, time, height, width, _ = tokens.shape
+        batch, time, height, width, _, device = *tokens.shape, tokens.device
         assert xnor(exists(cond), self.accept_cond)
 
         block_kwargs = dict()
@@ -474,6 +486,13 @@ class Transformer(Module):
 
         if self.has_time_attn:
             registers_time = repeat(self.registers_time, 'n d -> b n d', b = batch * height * width)
+
+        # prepare rotary embedding
+
+        time_arange = arange(time, device = device)
+        time_arange = F.pad(time_arange, (self.num_register_tokens, 0), value = -1e5)
+
+        time_rotary_emb = self.rotary_emb_time(time_arange)
 
         # space / time attention layers
 
@@ -506,7 +525,7 @@ class Transformer(Module):
 
                 tokens, inv_pack_registers = pack_with_inverse((registers_time, tokens), 'b * d')
 
-                tokens = time_attn(tokens, **block_kwargs)
+                tokens = time_attn(tokens, rotary_emb = time_rotary_emb, **block_kwargs)
                 tokens = time_ff(tokens, **block_kwargs)
 
                 registers_time, tokens = inv_pack_registers(tokens)
