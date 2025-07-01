@@ -30,7 +30,7 @@ dependencies = [
     "ema-pytorch",
     "jaxtyping",
     "hyper-connections>=0.2.1",
-    "rotary-embedding-torch",
+    "rotary-embedding-torch>=0.8.7",
     "torch>=2.4",
     "torchdiffeq",
     "torchvision",
