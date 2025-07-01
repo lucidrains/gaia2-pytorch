@@ -401,6 +401,12 @@ class Transformer(Module):
 
         self.rotary_emb_time = RotaryEmbedding(dim_head // 2)
 
+        self.rotary_emb_space = RotaryEmbedding(
+            dim_head // 2,
+            freqs_for = 'pixel',
+            max_freq = 256
+        )
+
         # prepare hyper connections
 
         init_hyperconn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_hyperconn_streams, num_fracs = num_hyperconn_fracs, dim = dim)
@@ -494,6 +500,14 @@ class Transformer(Module):
 
         time_rotary_emb = self.rotary_emb_time(time_arange)
 
+        space_rotary_emb = self.rotary_emb_space.get_axial_freqs(height, width)
+        space_register_rotary_emb = self.rotary_emb_space.get_axial_freqs(1, 1, offsets = (-100., -100.))
+
+        space_rotary_emb = rearrange(space_rotary_emb, 'h w d -> (h w) d')
+        space_register_rotary_emb = repeat(space_register_rotary_emb, '1 n d -> (n num_registers) d', num_registers = self.num_register_tokens)
+
+        space_rotary_emb = cat((space_register_rotary_emb, space_rotary_emb))
+
         # space / time attention layers
 
         for (
@@ -507,7 +521,7 @@ class Transformer(Module):
 
             tokens, inv_pack_registers = pack_with_inverse((registers_space, tokens), 'b * d')
 
-            tokens = space_attn(tokens, **block_kwargs)
+            tokens = space_attn(tokens, rotary_emb = space_rotary_emb, **block_kwargs)
             tokens = space_ff(tokens, **block_kwargs)
 
             registers_space, tokens = inv_pack_registers(tokens)
